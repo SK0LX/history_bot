@@ -1,0 +1,350 @@
+from aiogram import Bot, Dispatcher, types
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
+from aiogram.filters import Command
+import asyncio
+import random
+import re
+import docx
+import logging
+
+# Настройка логирования
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+TOKEN = "7290583229:AAHtO0FZOj9oVjje3eZLNPNed7Dr6h4XYu8"
+bot = Bot(token=TOKEN)
+dp = Dispatcher()
+
+questions = []
+user_sessions = {}
+
+
+def normalize(text):
+    """Нормализация текста для сравнения"""
+    if text is None:
+        return ""
+    text = str(text).lower()
+    text = re.sub(r'[^\w\s]', '', text)  # Удаляем пунктуацию
+    return text.strip()
+
+
+def load_questions_from_docx(filename):
+    doc = docx.Document(filename)
+    paras = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
+    i = 0
+    questions = []
+
+    while i < len(paras):
+        # Поиск начала вопроса
+        m = re.match(r"^Вопрос\s+(\d+)", paras[i])
+        if not m:
+            i += 1
+            continue
+
+        # Извлечение текста вопроса
+        question_text = paras[i][m.end():].strip()
+        if not question_text and i + 1 < len(paras):
+            i += 1
+            question_text = paras[i]
+
+        i += 1  # Переход к следующему параграфу
+
+        # Определение типа вопроса
+        q_type = "input"  # По умолчанию - ввод текста
+        options = []
+        answer = ""
+        votes = {}  # Для хранения голосов
+        multiple_answers = False  # Флаг для нескольких ответов
+
+        # Проверка на таблицу (множественный выбор)
+        if i < len(paras) and "Вариант ответа" in paras[i] and "За" in paras[i] and "Против" in paras[i]:
+            q_type = "multiple"
+            # Пропуск заголовка таблицы
+            i += 1
+            # Пропуск разделителя, если есть
+            if i < len(paras) and re.match(r'^-+$', paras[i]):
+                i += 1
+
+            # Чтение строк таблицы с извлечением голосов
+            table_data = []
+            while i < len(paras) and not paras[i].startswith("Больше всего ответили за:"):
+                # Разбиваем строку на колонки
+                cols = [col.strip() for col in re.split(r'\s{2,}', paras[i]) if col.strip()]
+
+                if len(cols) >= 2:
+                    option_text = cols[0]
+                    try:
+                        # Извлекаем голоса "За" (удаляем нечисловые символы)
+                        votes_count = int(re.sub(r'[^\d]', '', cols[1]))
+                    except ValueError:
+                        votes_count = 0
+
+                    table_data.append((option_text, votes_count))
+                    votes[option_text] = votes_count
+                i += 1
+
+            # Сортируем по голосам (по убыванию)
+            table_data.sort(key=lambda x: x[1], reverse=True)
+            options = [item[0] for item in table_data]
+            answer = [item[0] for item in table_data[:3]]  # Топ-3 варианта
+            multiple_answers = True
+
+        # Проверка на одиночный выбор
+        elif i < len(paras) and paras[i] in ["Ответы:", "### Ответы:"]:
+            q_type = "single"
+            i += 1  # Пропускаем заголовок "Ответы:"
+
+            # Собираем варианты ответов
+            while i < len(paras) and not paras[i].startswith("Больше всего ответили за:") and not re.match(
+                    r"^Вопрос\s+\d+", paras[i]):
+                if paras[i].startswith('-') or paras[i].startswith('•'):
+                    clean_opt = re.sub(r'^[-•]\s*', '', paras[i]).strip()
+                    if clean_opt:
+                        options.append(clean_opt)
+                elif paras[i].strip():
+                    options.append(paras[i].strip())
+                i += 1
+
+        # Обработка правильного ответа для всех типов
+        if i < len(paras) and "Больше всего ответили за:" in paras[i]:
+            raw = paras[i]
+            raw = raw.replace("Больше всего ответили за:", "").strip()
+            clean_answer = re.sub(r'\*\*([^*]+)\*\*', r'\1', raw)
+            clean_answer = re.sub(r'\(\d+\s*человек\)', '', clean_answer).strip()
+
+            # Определяем, содержит ли ответ несколько вариантов
+            if "," in clean_answer:
+                answer = [ans.strip() for ans in clean_answer.split(",")]
+                multiple_answers = True
+            elif ";" in clean_answer:
+                answer = [ans.strip() for ans in clean_answer.split(";")]
+                multiple_answers = True
+            else:
+                answer = clean_answer
+
+            # Для типов кроме multiple используем извлеченный ответ
+            if q_type != "multiple":
+                # Если вопрос был помечен как input, но имеет несколько ответов
+                if multiple_answers:
+                    q_type = "multiple"
+            i += 1
+
+        # Корректировка типа для вопросов с вариантами
+        if not answer and options:
+            q_type = "single"
+            answer = options[0] if options else ""
+
+        # Сохранение вопроса
+        question_data = {
+            "question": question_text,
+            "options": options,
+            "answer": answer,
+            "type": q_type,
+            "multiple_answers": multiple_answers  # Добавляем флаг множественных ответов
+        }
+
+        # Сохраняем голоса для множественного выбора
+        if q_type == "multiple":
+            question_data["votes"] = votes
+
+        questions.append(question_data)
+
+    return questions
+
+
+# Загрузка вопросов
+try:
+    questions = load_questions_from_docx("База по История России НТК.docx")
+    if not questions:
+        logger.error("No questions loaded! Check document structure.")
+    else:
+        logger.info(f"Successfully loaded {len(questions)} questions")
+except Exception as e:
+    logger.exception(f"Error loading questions: {e}")
+
+
+async def start_quiz(message: types.Message):
+    user_id = message.from_user.id
+
+    # Если вопросы не загружены
+    if not questions:
+        await message.answer("❌ Ошибка загрузки вопросов. Пожалуйста, проверьте файл с вопросами.")
+        return
+
+    user_sessions[user_id] = {"score": 0, "asked": []}
+    await send_question(message)
+
+
+async def send_question(message: types.Message):
+    user_id = message.from_user.id
+    session = user_sessions[user_id]
+    total = len(questions)
+
+    if len(session["asked"]) >= total:
+        await message.answer(f"Тест завершён! Правильных ответов: {session['score']} из {total}")
+        return
+
+    # Выбор случайного вопроса
+    available = [idx for idx in range(total) if idx not in session["asked"]]
+    if not available:
+        await message.answer("Все вопросы закончились!")
+        return
+
+    q_idx = random.choice(available)
+    session["asked"].append(q_idx)
+    session["current_idx"] = q_idx
+    q = questions[q_idx]
+
+    # Отправка вопроса в зависимости от типа
+    if q["type"] == "multiple":
+        if q["options"]:
+            # Форматируем варианты с номерами
+            options_text = "\n".join([f"{idx + 1}. {opt}" for idx, opt in enumerate(q["options"])])
+            question_text = f"{q['question']}\n\n{options_text}\n\n"
+
+            # Добавляем подсказку в зависимости от типа ответа
+            if q.get("multiple_answers", False):
+                question_text += "Введите номера правильных вариантов через запятую (например: 1,2,3):"
+            else:
+                question_text += "Выберите один правильный вариант:"
+
+            await message.answer(question_text, reply_markup=ReplyKeyboardRemove())
+        else:
+            # Если нет вариантов для множественного выбора
+            await message.answer(
+                f"{q['question']}\n\n⚠️ Для этого вопроса не загружены варианты ответов. Пожалуйста, введите ответ вручную.")
+            session["current_question"] = q  # Сохраняем вопрос для ручной проверки
+
+    elif q["type"] == "single" and q["options"]:
+        # Создаем кнопки для вариантов
+        buttons = [[KeyboardButton(text=opt)] for opt in q["options"] if opt]
+        markup = ReplyKeyboardMarkup(
+            keyboard=buttons,
+            resize_keyboard=True,
+            one_time_keyboard=True
+        )
+        await message.answer(q["question"], reply_markup=markup)
+
+    else:  # Ввод текста или вопрос без вариантов
+        if isinstance(q["answer"], list):
+            # Если несколько ответов - добавляем подсказку
+            await message.answer(f"{q['question']}\n(Перечислите ответы через запятую)",
+                                 reply_markup=ReplyKeyboardRemove())
+        else:
+            await message.answer(q['question'], reply_markup=ReplyKeyboardRemove())
+
+
+async def handle_answer(message: types.Message):
+    user_id = message.from_user.id
+    text = message.text.strip()
+
+    if user_id not in user_sessions:
+        return await message.answer("Введите /start для начала теста")
+
+    session = user_sessions[user_id]
+    q_idx = session["current_idx"]
+    q = questions[q_idx]
+    correct = q["answer"]
+    is_multiple = q.get("multiple_answers", False)
+
+    # Проверка наличия правильного ответа
+    if not correct:
+        await message.answer("⚠️ Для этого вопроса не загружен правильный ответ. Переходим к следующему вопросу.")
+        await send_question(message)
+        return
+
+    # Обработка ответа в зависимости от типа вопроса
+    if q["type"] == "multiple":
+        if not q["options"]:
+            # Ручная проверка для вопросов без вариантов
+            if is_multiple and isinstance(correct, list):
+                # Обработка нескольких ответов
+                user_answers = [normalize(ans) for ans in re.split(r'[,;]', text)]
+                correct_normalized = [normalize(c) for c in correct]
+
+                if set(user_answers) == set(correct_normalized):
+                    session["score"] += 1
+                    await message.answer("✅ Верно!")
+                else:
+                    correct_text = ", ".join(correct)
+                    await message.answer(f"❌ Неверно. Правильные ответы: {correct_text}")
+            else:
+                # Одиночный ответ
+                if normalize(text) == normalize(correct):
+                    session["score"] += 1
+                    await message.answer("✅ Верно!")
+                else:
+                    await message.answer(f"❌ Неверно. Правильный ответ: {correct}")
+
+        else:
+            try:
+                # Парсим введенные номера
+                selected_indexes = [int(idx.strip()) - 1 for idx in text.split(",") if idx.strip().isdigit()]
+                selected_options = [q["options"][idx] for idx in selected_indexes if 0 <= idx < len(q["options"])]
+
+                # Для вопросов с одним правильным ответом
+                if not is_multiple:
+                    if len(selected_options) == 1 and normalize(selected_options[0]) == normalize(correct):
+                        session["score"] += 1
+                        await message.answer("✅ Верно!")
+                    else:
+                        await message.answer(f"❌ Неверно. Правильный ответ: {correct}")
+                else:
+                    # Для вопросов с несколькими ответами
+                    # Сортируем для сравнения
+                    sorted_selected = sorted([normalize(opt) for opt in selected_options])
+                    sorted_correct = sorted([normalize(c) for c in correct])
+
+                    # Сравниваем ответы
+                    if sorted_selected == sorted_correct:
+                        session["score"] += 1
+                        await message.answer("✅ Верно!")
+                    else:
+                        correct_text = ", ".join(correct)
+                        await message.answer(f"❌ Неверно. Правильные ответы: {correct_text}")
+
+            except (ValueError, IndexError):
+                await message.answer("❌ Неверный формат. Введите номера через запятую (например: 1,2,3)")
+                return  # Не переходим к следующему вопросу
+
+    elif q["type"] == "single":
+        # Сравниваем ответы
+        if normalize(text) == normalize(correct):
+            session["score"] += 1
+            await message.answer("✅ Верно!")
+        else:
+            await message.answer(f"❌ Неверно. Правильный ответ: {correct}")
+
+    else:  # Ввод текста
+        if is_multiple and isinstance(correct, list):
+            # Обработка нескольких ответов
+            user_answers = [normalize(ans) for ans in re.split(r'[,;]', text)]
+            correct_normalized = [normalize(c) for c in correct]
+
+            if set(user_answers) == set(correct_normalized):
+                session["score"] += 1
+                await message.answer("✅ Верно!")
+            else:
+                correct_text = ", ".join(correct)
+                await message.answer(f"❌ Неверно. Правильные ответы: {correct_text}")
+        else:
+            # Одиночный ответ
+            if normalize(text) == normalize(correct):
+                session["score"] += 1
+                await message.answer("✅ Верно!")
+            else:
+                await message.answer(f"❌ Неверно. Правильный ответ: {correct}")
+
+    await send_question(message)
+
+
+dp.message.register(start_quiz, Command("start"))
+dp.message.register(handle_answer)
+
+
+async def main():
+    await dp.start_polling(bot, skip_updates=True)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
